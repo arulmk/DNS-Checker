@@ -1,0 +1,887 @@
+<!doctype html>
+<!--
+  DNS Pulse & Dig Interface — Phase 1 MVP
+  ---------------------------------------------------------------------------
+  Single file, no build step. Vanilla HTML + Tailwind (CDN) + ESNext modules.
+
+  Layout of this file
+    1. <head>      theme bootstrap, Tailwind CDN, a few component classes
+    2. <body>      header, query form + control groups, results mount, toast
+    3. <script>    small, pure-ish modules in one place:
+         config      resolvers, record types, regions
+         helpers     h() DOM builder, badges, formatting
+         url state   readable params + compact base64url "q" param
+         doh         queryDoH() -> one normalized response shape
+         parsers     TXT / SPF / MX / CNAME chain / DNSSEC badge
+         views       renderers (always textContent, never innerHTML)
+         propagation simulated 10-region matrix (seeded, deterministic)
+         commands    dig + BIND snippet generators
+         controller  run(), event wiring, init()
+
+  Security note: DNS answers (especially TXT) are attacker-controlled.
+  Nothing from a DNS response is ever inserted with innerHTML.
+-->
+<html lang="en" class="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>DNS Pulse &amp; Dig</title>
+  <meta name="description" content="Client-side DNS lookups over DoH (Google and Cloudflare) with a DNSSEC indicator, simulated trace and propagation view.">
+
+  <!-- Apply the saved theme before first paint to avoid a flash. -->
+  <script>
+    try { if (localStorage.getItem('dnspulse-theme') === 'light') document.documentElement.classList.remove('dark'); } catch (_) {}
+  </script>
+
+  <!-- Tailwind via CDN: fine for the MVP, swap for a compiled CSS file in Phase 2. -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>tailwind.config = { darkMode: 'class' };</script>
+
+  <style type="text/tailwindcss">
+    @layer components {
+      .card   { @apply rounded-xl border border-slate-200 bg-white p-4 shadow-sm dark:border-slate-800 dark:bg-slate-900; }
+      .lbl    { @apply block text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400; }
+      .field  { @apply w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900 placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-sky-500 disabled:cursor-not-allowed disabled:opacity-50 dark:border-slate-700 dark:bg-slate-950 dark:text-slate-100 dark:placeholder-slate-500; }
+      .btn    { @apply inline-flex items-center justify-center gap-2 rounded-lg px-3 py-2 text-sm font-medium focus:outline-none focus-visible:ring-2 focus-visible:ring-sky-500 disabled:cursor-not-allowed disabled:opacity-60; }
+      .btn-primary { @apply btn bg-sky-600 text-white hover:bg-sky-500; }
+      .btn-ghost   { @apply btn border border-slate-300 text-slate-700 hover:bg-slate-100 dark:border-slate-700 dark:text-slate-200 dark:hover:bg-slate-800; }
+      .chip   { @apply rounded-md border border-slate-300 px-2 py-0.5 text-xs text-slate-600 hover:bg-slate-100 focus:outline-none focus-visible:ring-2 focus-visible:ring-sky-500 dark:border-slate-700 dark:text-slate-300 dark:hover:bg-slate-800; }
+      .help-btn  { @apply inline-flex h-5 w-5 shrink-0 items-center justify-center rounded-full border border-slate-300 text-[11px] text-slate-500 hover:bg-slate-100 focus:outline-none focus-visible:ring-2 focus-visible:ring-sky-500 dark:border-slate-600 dark:text-slate-400 dark:hover:bg-slate-800; }
+      .help-text { @apply mt-1 text-xs leading-relaxed text-slate-500 dark:text-slate-400; }
+      .opt-row   { @apply flex items-center gap-2 text-sm; }
+    }
+  </style>
+</head>
+
+<body class="min-h-screen bg-slate-50 text-slate-900 antialiased dark:bg-slate-950 dark:text-slate-100">
+  <a href="#results" class="sr-only focus:not-sr-only focus:absolute focus:left-2 focus:top-2 focus:rounded focus:bg-sky-600 focus:px-3 focus:py-1 focus:text-white">Skip to results</a>
+
+  <header class="border-b border-slate-200 bg-white/80 backdrop-blur dark:border-slate-800 dark:bg-slate-900/80">
+    <div class="mx-auto flex max-w-7xl items-center justify-between gap-4 px-4 py-3">
+      <div class="flex items-center gap-3">
+        <div class="flex h-9 w-9 items-center justify-center rounded-lg bg-sky-600 font-mono text-sm font-bold text-white" aria-hidden="true">DNS</div>
+        <div>
+          <h1 class="text-base font-semibold leading-tight">DNS Pulse &amp; Dig</h1>
+          <p class="text-xs text-slate-500 dark:text-slate-400">Lookups straight from your browser over DoH. No backend.</p>
+        </div>
+      </div>
+      <button id="theme-toggle" type="button" class="btn-ghost" aria-label="Toggle light and dark theme">
+        <span id="theme-label">Theme</span>
+      </button>
+    </div>
+  </header>
+
+  <noscript>
+    <div class="mx-auto mt-4 max-w-3xl rounded-lg border border-amber-300 bg-amber-50 p-4 text-sm text-amber-900">
+      This tool runs DNS-over-HTTPS queries in your browser, so it needs JavaScript enabled.
+    </div>
+  </noscript>
+
+  <main class="mx-auto grid max-w-7xl gap-6 px-4 py-6 lg:grid-cols-[360px_minmax(0,1fr)]">
+
+    <!-- ===================== Controls ===================== -->
+    <!-- A real <form> with named fields keeps the markup honest; JS intercepts submit. -->
+    <form id="query-form" method="get" action="" novalidate class="space-y-4">
+
+      <section class="card space-y-3" aria-labelledby="h-query">
+        <h2 id="h-query" class="sr-only">Query</h2>
+        <div>
+          <label for="domain" class="lbl">Domain</label>
+          <div class="mt-1 flex gap-2">
+            <input id="domain" name="d" type="text" inputmode="url" autocapitalize="none" autocomplete="off" spellcheck="false"
+                   placeholder="example.com" class="field font-mono" aria-describedby="form-error">
+            <button id="run" type="submit" class="btn-primary shrink-0">Resolve</button>
+          </div>
+          <p id="form-error" role="alert" class="mt-2 text-sm text-red-600 dark:text-red-400" hidden></p>
+        </div>
+
+        <div class="grid grid-cols-2 gap-3">
+          <div>
+            <label for="type" class="lbl">Record type</label>
+            <select id="type" name="t" class="field mt-1">
+              <option>A</option><option>AAAA</option><option>CNAME</option><option>MX</option>
+              <option>TXT</option><option>NS</option><option>SOA</option>
+            </select>
+          </div>
+          <div>
+            <label for="resolver" class="lbl">Resolver</label>
+            <select id="resolver" name="r" class="field mt-1">
+              <option value="google">Google 8.8.8.8</option>
+              <option value="cloudflare">Cloudflare 1.1.1.1</option>
+            </select>
+          </div>
+        </div>
+
+        <div>
+          <p class="lbl">Try one</p>
+          <div id="examples" class="mt-1 flex flex-wrap gap-1.5"></div>
+        </div>
+      </section>
+
+      <fieldset class="card space-y-2">
+        <legend class="lbl float-left mb-2 w-full">Resolution mode</legend>
+        <label class="opt-row"><input type="radio" name="m" value="standard" class="accent-sky-500"> Standard lookup</label>
+        <div class="opt-row"><label class="opt-row"><input type="radio" name="m" value="trace" class="accent-sky-500"> Simulated trace</label>
+          <button type="button" class="help-btn" data-help="help-trace" aria-expanded="false" aria-label="About simulated trace">?</button></div>
+        <p id="help-trace" class="help-text" hidden>Browsers cannot walk the delegation chain themselves. This asks NS for each zone from root down through your resolver, which gives real data, but the resolver does the recursion, not us.</p>
+        <div class="opt-row"><label class="opt-row"><input type="radio" name="m" value="compare" class="accent-sky-500"> Compare resolvers</label>
+          <button type="button" class="help-btn" data-help="help-compare" aria-expanded="false" aria-label="About compare">?</button></div>
+        <p id="help-compare" class="help-text" hidden>Queries Google and Cloudflare in parallel and flags whether their answers match. The resolver picker is ignored in this mode.</p>
+      </fieldset>
+
+      <fieldset class="card space-y-2">
+        <legend class="lbl float-left mb-2 w-full">DNSSEC</legend>
+        <div>
+          <div class="opt-row"><label class="opt-row"><input type="checkbox" id="opt-do" class="accent-sky-500"> DO bit (request DNSSEC data)</label>
+            <button type="button" class="help-btn" data-help="help-do" aria-expanded="false" aria-label="About the DO bit">?</button></div>
+          <p id="help-do" class="help-text" hidden>"DNSSEC OK" asks the resolver to include signature records and report validation. Without it the AD indicator can't be trusted.</p>
+        </div>
+        <div>
+          <div class="opt-row"><label class="opt-row"><input type="checkbox" id="opt-cd" class="accent-sky-500"> CD bit (skip validation)</label>
+            <button type="button" class="help-btn" data-help="help-cd" aria-expanded="false" aria-label="About the CD bit">?</button></div>
+          <p id="help-cd" class="help-text" hidden>"Checking Disabled" returns the answer even if DNSSEC validation would fail. Handy to tell a broken signature (SERVFAIL, then works with CD) from a dead server.</p>
+        </div>
+      </fieldset>
+
+      <fieldset class="card space-y-2">
+        <legend class="lbl float-left mb-2 w-full">Output formatting</legend>
+        <label class="opt-row"><input type="radio" name="fmt" value="verbose" class="accent-sky-500"> Verbose (TTLs, flags, authority)</label>
+        <label class="opt-row"><input type="radio" name="fmt" value="short" class="accent-sky-500"> Short (like <code class="font-mono text-xs">dig +short</code>)</label>
+      </fieldset>
+
+      <fieldset class="card space-y-3">
+        <legend class="lbl float-left mb-2 w-full">EDNS options</legend>
+        <div>
+          <div class="flex items-center gap-2">
+            <label for="opt-ecs" class="text-sm">Client subnet (ECS)</label>
+            <button type="button" class="help-btn" data-help="help-ecs" aria-expanded="false" aria-label="About client subnet">?</button>
+          </div>
+          <input id="opt-ecs" name="ecs" type="text" autocomplete="off" spellcheck="false" placeholder="203.0.113.0/24" class="field mt-1 font-mono">
+          <p id="ecs-note" class="help-text" hidden>Only Google's JSON API supports this, so it is disabled for Cloudflare.</p>
+          <p id="help-ecs" class="help-text" hidden>Pretends the query came from this network so GeoDNS / CDN answers reflect another location. Use 0.0.0.0/0 to hide your own subnet.</p>
+        </div>
+        <label class="opt-row opacity-60"><input type="checkbox" disabled> Request NSID
+          <span class="rounded bg-slate-200 px-1.5 text-[10px] uppercase dark:bg-slate-700">Phase 2</span></label>
+        <label class="opt-row opacity-60"><input type="checkbox" disabled> Response padding
+          <span class="rounded bg-slate-200 px-1.5 text-[10px] uppercase dark:bg-slate-700">Phase 2</span></label>
+        <p class="help-text">NSID and padding need the binary <code class="font-mono">application/dns-message</code> format, which arrives in Phase 2.</p>
+      </fieldset>
+    </form>
+
+    <!-- ===================== Results ===================== -->
+    <section id="results" class="min-w-0 space-y-4" aria-live="polite" aria-busy="false" tabindex="-1">
+      <div class="card text-sm text-slate-500 dark:text-slate-400">
+        Enter a domain and hit <strong class="text-slate-700 dark:text-slate-200">Resolve</strong>. Results, a dig-style command and a BIND snippet appear here.
+      </div>
+    </section>
+  </main>
+
+  <footer class="mx-auto max-w-7xl px-4 pb-8 text-xs text-slate-500 dark:text-slate-400">
+    Queries go directly from your browser to dns.google or cloudflare-dns.com. Regional propagation and the trace path are simulated or resolver-side, and labeled as such.
+  </footer>
+
+  <div id="toast" role="status" aria-live="polite"
+       class="pointer-events-none fixed bottom-4 left-1/2 -translate-x-1/2 rounded-lg bg-slate-900 px-4 py-2 text-sm text-white opacity-0 shadow-lg transition-opacity dark:bg-slate-100 dark:text-slate-900"></div>
+
+<script type="module">
+/* ======================================================================
+   CONFIG
+   ====================================================================== */
+const DOH = {
+  google:     { label: 'Google',     ip: '8.8.8.8', base: 'https://dns.google/resolve',                 ecs: true  },
+  cloudflare: { label: 'Cloudflare', ip: '1.1.1.1', base: 'https://cloudflare-dns.com/dns-query',       ecs: false },
+};
+const TYPES = { A: 1, NS: 2, CNAME: 5, SOA: 6, MX: 15, TXT: 16, AAAA: 28 };
+const TYPE_NAMES = { 1: 'A', 2: 'NS', 5: 'CNAME', 6: 'SOA', 15: 'MX', 16: 'TXT', 28: 'AAAA', 43: 'DS', 46: 'RRSIG', 47: 'NSEC', 48: 'DNSKEY', 50: 'NSEC3' };
+const RCODES = { 0: 'NOERROR', 1: 'FORMERR', 2: 'SERVFAIL', 3: 'NXDOMAIN', 4: 'NOTIMP', 5: 'REFUSED' };
+const TIMEOUT_MS = 8000;
+
+// Placeholder base round-trip times (ms) for the simulated matrix.
+const REGIONS = [
+  { name: 'Mumbai', base: 24 }, { name: 'Chennai', base: 18 }, { name: 'Singapore', base: 38 },
+  { name: 'Tokyo', base: 74 }, { name: 'Sydney', base: 112 }, { name: 'Frankfurt', base: 126 },
+  { name: 'London', base: 134 }, { name: 'São Paulo', base: 188 }, { name: 'N. Virginia', base: 204 },
+  { name: 'California', base: 236 },
+];
+const EXAMPLES = [
+  ['example.com', 'A'], ['gmail.com', 'MX'], ['google.com', 'TXT'], ['www.github.com', 'CNAME'], ['cloudflare.com', 'AAAA'],
+];
+const DKIM_SELECTORS = ['default', 'google', 'selector1', 'selector2', 'k1', 's1'];
+
+const DEFAULTS = { domain: '', type: 'A', resolver: 'google', mode: 'standard', fmt: 'verbose', opts: { do: true, cd: false }, ecs: '' };
+let state = structuredClone(DEFAULTS);
+
+/* ======================================================================
+   DOM HELPERS  (h() only ever creates text nodes, never parses HTML)
+   ====================================================================== */
+const $ = (sel, root = document) => root.querySelector(sel);
+
+function h(tag, props = {}, ...kids) {
+  const el = document.createElement(tag);
+  for (const [k, v] of Object.entries(props)) {
+    if (v == null || v === false) continue;
+    if (k === 'class') el.className = v;
+    else if (k.startsWith('on')) el.addEventListener(k.slice(2).toLowerCase(), v);
+    else el.setAttribute(k, v === true ? '' : v);
+  }
+  for (const kid of kids.flat(Infinity)) {
+    if (kid == null || kid === false) continue;
+    el.append(kid instanceof Node ? kid : document.createTextNode(String(kid)));
+  }
+  return el;
+}
+
+const TONES = {
+  green:  'bg-emerald-100 text-emerald-800 ring-emerald-600/20 dark:bg-emerald-500/15 dark:text-emerald-300 dark:ring-emerald-400/30',
+  amber:  'bg-amber-100 text-amber-800 ring-amber-600/20 dark:bg-amber-500/15 dark:text-amber-300 dark:ring-amber-400/30',
+  red:    'bg-red-100 text-red-800 ring-red-600/20 dark:bg-red-500/15 dark:text-red-300 dark:ring-red-400/30',
+  sky:    'bg-sky-100 text-sky-800 ring-sky-600/20 dark:bg-sky-500/15 dark:text-sky-300 dark:ring-sky-400/30',
+  violet: 'bg-violet-100 text-violet-800 ring-violet-600/20 dark:bg-violet-500/15 dark:text-violet-300 dark:ring-violet-400/30',
+  slate:  'bg-slate-100 text-slate-700 ring-slate-500/20 dark:bg-slate-700/40 dark:text-slate-300 dark:ring-slate-400/20',
+};
+const badge = (text, tone = 'slate', title) =>
+  h('span', { class: `inline-flex items-center gap-1 whitespace-nowrap rounded-full px-2 py-0.5 text-xs font-medium ring-1 ring-inset ${TONES[tone]}`, title }, text);
+
+const mono = (text, extra = '') => h('code', { class: `break-all font-mono text-[13px] ${extra}` }, text);
+
+function card(title, subtitle, ...body) {
+  return h('section', { class: 'card space-y-3' },
+    h('div', {}, h('h2', { class: 'text-sm font-semibold' }, title), subtitle && h('p', { class: 'text-xs text-slate-500 dark:text-slate-400' }, subtitle)),
+    ...body);
+}
+
+const humanTTL = (s) => {
+  if (s >= 86400) return `${Math.round(s / 86400)}d`;
+  if (s >= 3600) return `${Math.round(s / 3600)}h`;
+  if (s >= 60) return `${Math.round(s / 60)}m`;
+  return `${s}s`;
+};
+
+let toastTimer;
+function toast(msg) {
+  const t = $('#toast');
+  t.textContent = msg;
+  t.classList.remove('opacity-0');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => t.classList.add('opacity-0'), 1600);
+}
+
+async function copyText(text, label = 'Copied') {
+  try {
+    await navigator.clipboard.writeText(text);     // throws if unavailable (e.g. insecure context)
+    toast(label);
+  } catch {
+    try {
+      const ta = h('textarea', { 'aria-hidden': 'true', style: 'position:fixed;opacity:0' });
+      ta.value = text;
+      document.body.append(ta);
+      ta.select();
+      document.execCommand('copy');
+      ta.remove();
+      toast(label);
+    } catch { toast('Copy failed'); }
+  }
+}
+const copyBtn = (text, label = 'Copy', toastMsg) =>
+  h('button', { type: 'button', class: 'chip', onclick: () => copyText(text, toastMsg || 'Copied') }, label);
+
+/* ======================================================================
+   URL STATE  (?d=&t=&r=&m=&o=do,cd,short&ecs=  or compact ?q=<base64url JSON>)
+   ====================================================================== */
+const b64uEncode = (obj) => {
+  const bytes = new TextEncoder().encode(JSON.stringify(obj));
+  let bin = ''; bytes.forEach((b) => { bin += String.fromCharCode(b); });
+  return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+};
+const b64uDecode = (str) => {
+  const pad = '='.repeat((4 - (str.length % 4)) % 4);
+  const bin = atob(str.replace(/-/g, '+').replace(/_/g, '/') + pad);
+  return JSON.parse(new TextDecoder().decode(Uint8Array.from(bin, (c) => c.charCodeAt(0))));
+};
+
+// Whitelist everything that comes from the URL.
+function sanitize(raw = {}) {
+  const s = structuredClone(DEFAULTS);
+  if (typeof raw.d === 'string') s.domain = raw.d.slice(0, 260);
+  const t = String(raw.t || '').toUpperCase();   if (Object.hasOwn(TYPES, t)) s.type = t;
+  const r = String(raw.r || '').toLowerCase();   if (Object.hasOwn(DOH, r)) s.resolver = r;
+  const m = String(raw.m || '').toLowerCase();   if (['standard', 'trace', 'compare'].includes(m)) s.mode = m;
+  if (Array.isArray(raw.o)) {
+    s.opts.do = raw.o.includes('do');
+    s.opts.cd = raw.o.includes('cd');
+    if (raw.o.includes('short')) s.fmt = 'short';
+  }
+  if (typeof raw.ecs === 'string' && /^[0-9a-fA-F:.]{2,45}\/\d{1,3}$/.test(raw.ecs)) s.ecs = raw.ecs;
+  return s;
+}
+
+function readUrl() {
+  const p = new URLSearchParams(location.search);
+  const q = p.get('q');
+  if (q) { try { return sanitize(b64uDecode(q)); } catch { /* bad q: fall back to readable params */ } }
+  return sanitize({
+    d: p.get('d'), t: p.get('t'), r: p.get('r'), m: p.get('m'), ecs: p.get('ecs'),
+    o: p.has('o') ? p.get('o').split(',').filter(Boolean) : ['do'],   // explicit o= wins, even if empty
+  });
+}
+
+function toPayload(s) {
+  const o = [];
+  if (s.opts.do) o.push('do');
+  if (s.opts.cd) o.push('cd');
+  if (s.fmt === 'short') o.push('short');
+  const p = { d: s.domain, t: s.type, r: s.resolver, m: s.mode, o };
+  if (s.ecs) p.ecs = s.ecs;
+  return p;
+}
+
+function shareUrl(compact) {
+  const base = location.href.split(/[?#]/)[0];   // works on file:// too (origin would be "null")
+  const p = toPayload(state);
+  if (compact) return `${base}?q=${b64uEncode(p)}`;
+  const u = new URLSearchParams({ d: p.d, t: p.t, r: p.r, m: p.m, o: p.o.join(',') });
+  if (p.ecs) u.set('ecs', p.ecs);
+  return `${base}?${u}`;
+}
+
+function writeUrl() {
+  try { history.replaceState(null, '', shareUrl(false)); } catch { /* sandboxed or file:// */ }
+}
+
+/* ======================================================================
+   FORM <-> STATE
+   ====================================================================== */
+const els = {
+  form: $('#query-form'), domain: $('#domain'), type: $('#type'), resolver: $('#resolver'),
+  run: $('#run'), error: $('#form-error'), results: $('#results'),
+  optDo: $('#opt-do'), optCd: $('#opt-cd'), ecs: $('#opt-ecs'), ecsNote: $('#ecs-note'),
+};
+
+function applyStateToForm() {
+  els.domain.value = state.domain;
+  els.type.value = state.type;
+  els.resolver.value = state.resolver;
+  els.optDo.checked = state.opts.do;
+  els.optCd.checked = state.opts.cd;
+  els.ecs.value = state.ecs;
+  $(`input[name=m][value=${state.mode}]`).checked = true;
+  $(`input[name=fmt][value=${state.fmt}]`).checked = true;
+  syncAvailability();
+}
+
+function readFormIntoState() {
+  state.domain = els.domain.value;
+  state.type = els.type.value;
+  state.resolver = els.resolver.value;
+  state.mode = $('input[name=m]:checked').value;
+  state.fmt = $('input[name=fmt]:checked').value;
+  state.opts = { do: els.optDo.checked, cd: els.optCd.checked };
+  const ecs = els.ecs.value.trim();
+  state.ecs = /^[0-9a-fA-F:.]{2,45}\/\d{1,3}$/.test(ecs) ? ecs : '';
+}
+
+// Non-blocking: unsupported options are disabled with an explanation, never hidden.
+function syncAvailability() {
+  const mode = $('input[name=m]:checked')?.value;
+  const compare = mode === 'compare';
+  els.resolver.disabled = compare;
+  const ecsOff = !compare && els.resolver.value === 'cloudflare';
+  els.ecs.disabled = ecsOff;
+  els.ecsNote.hidden = !ecsOff;
+}
+
+function showError(msg) { els.error.textContent = msg; els.error.hidden = false; els.domain.setAttribute('aria-invalid', 'true'); }
+function hideError() { els.error.hidden = true; els.domain.removeAttribute('aria-invalid'); }
+
+/* ======================================================================
+   DOMAIN VALIDATION  (accepts pasted URLs, converts IDN to punycode)
+   ====================================================================== */
+const HOST_RE = /^(?=.{1,253}$)[a-z0-9_]([a-z0-9_-]{0,61}[a-z0-9_])?(\.[a-z0-9_]([a-z0-9_-]{0,61}[a-z0-9_])?)*$/;
+
+function normalizeDomain(input) {
+  let s = (input || '').trim();
+  if (!s) throw new Error('Enter a domain name first.');
+  s = s.replace(/^[a-z][a-z0-9+.-]*:\/\//i, '').split(/[/?#]/)[0].replace(/:\d+$/, '').replace(/\.$/, '');
+  let host;
+  try { host = new URL(`http://${s}`).hostname; }       // lowercases + punycodes IDNs
+  catch { throw new Error('That does not look like a valid hostname.'); }
+  host = host.replace(/\.$/, '');
+  if (/^\d{1,3}(\.\d{1,3}){3}$/.test(host)) throw new Error('IP addresses need PTR lookups, which arrive in Phase 2.');
+  if (!HOST_RE.test(host)) throw new Error('Use letters, digits, hyphens and dots (labels up to 63 characters).');
+  return host;
+}
+
+/* ======================================================================
+   DoH LAYER  -> one normalized shape for both resolvers
+   ====================================================================== */
+const normRR = (rr) => ({
+  name: rr.name, type: rr.type, typeName: TYPE_NAMES[rr.type] || `TYPE${rr.type}`, ttl: rr.TTL, data: String(rr.data ?? ''),
+});
+
+async function queryDoH(resolverKey, name, type, opts, outerSignal) {
+  const r = DOH[resolverKey];
+  const u = new URL(r.base);
+  u.searchParams.set('name', name);
+  u.searchParams.set('type', type);
+  if (opts.do) u.searchParams.set('do', 'true');
+  if (opts.cd) u.searchParams.set('cd', 'true');
+  if (r.ecs && opts.ecs) u.searchParams.set('edns_client_subnet', opts.ecs);
+
+  const timeout = new AbortController();
+  const timer = setTimeout(() => timeout.abort(), TIMEOUT_MS);
+  const onOuterAbort = () => timeout.abort();
+  outerSignal?.addEventListener('abort', onOuterAbort, { once: true });
+  const t0 = performance.now();
+  try {
+    const res = await fetch(u, { headers: { Accept: 'application/dns-json' }, signal: timeout.signal, cache: 'no-store' });
+    if (!res.ok) throw new Error(`HTTP ${res.status} from ${r.label}`);
+    const j = await res.json();
+    return {
+      ok: true, resolver: resolverKey, status: j.Status,
+      flags: { AD: !!j.AD, CD: !!j.CD, RD: !!j.RD, RA: !!j.RA, TC: !!j.TC },
+      answers: (j.Answer || []).map(normRR), authority: (j.Authority || []).map(normRR),
+      comment: Array.isArray(j.Comment) ? j.Comment.join(' ') : (j.Comment || ''),
+      rttMs: Math.round(performance.now() - t0),
+    };
+  } catch (e) {
+    let msg = e.message || 'Request failed';
+    if (outerSignal?.aborted) msg = 'Cancelled';
+    else if (timeout.signal.aborted) msg = `Timed out after ${TIMEOUT_MS / 1000}s`;
+    else if (e instanceof TypeError) msg = `Could not reach ${r.label} (network, ad-blocker or CORS)`;
+    return { ok: false, resolver: resolverKey, error: msg, rttMs: Math.round(performance.now() - t0) };
+  } finally {
+    clearTimeout(timer);
+    outerSignal?.removeEventListener('abort', onOuterAbort);
+  }
+}
+
+/* ======================================================================
+   PARSERS
+   ====================================================================== */
+// TXT data arrives quoted, possibly as several "chunks". Join and unescape.
+function parseTxtData(data) {
+  const parts = [...data.matchAll(/"((?:[^"\\]|\\.)*)"/g)].map((m) => m[1]);
+  const raw = parts.length ? parts.join('') : data;
+  return raw.replace(/\\(\d{3})/g, (_, d) => String.fromCharCode(+d)).replace(/\\(.)/g, '$1');
+}
+
+function classifyTxt(text, owner) {
+  const t = text.trim();
+  if (/^v=spf1(\s|$)/i.test(t)) return 'SPF';
+  if (/^v=DKIM1\b/i.test(t)) return 'DKIM';
+  if (/^v=DMARC1\b/i.test(t)) return 'DMARC';
+  if (/^v=BIMI1\b/i.test(t)) return 'BIMI';
+  if (/_domainkey\./i.test(owner) && /(^|;\s*)p=/i.test(t)) return 'DKIM';
+  if (/^[\w.-]*verification[\w.-]*=/i.test(t)) return 'Verification';
+  return null;
+}
+const KIND_TONE = { SPF: 'sky', DKIM: 'violet', DMARC: 'green', BIMI: 'amber', Verification: 'slate' };
+
+function spfToken(tok) {
+  const base = 'mr-1.5 inline-block rounded px-1 font-mono text-[13px]';
+  if (/^[+\-~?]?all$/i.test(tok)) {
+    const q = /^[+\-~?]/.test(tok) ? tok[0] : '+';
+    const map = {
+      '-': ['text-red-700 bg-red-50 dark:text-red-300 dark:bg-red-500/10', 'Fail: reject anything not listed'],
+      '~': ['text-amber-700 bg-amber-50 dark:text-amber-300 dark:bg-amber-500/10', 'SoftFail: accept but mark suspicious'],
+      '?': ['text-slate-600 bg-slate-100 dark:text-slate-300 dark:bg-slate-700/40', 'Neutral: no policy'],
+      '+': ['text-red-800 bg-red-100 font-bold dark:text-red-200 dark:bg-red-500/20', 'Pass: allows every sender (insecure)'],
+    }[q];
+    return h('span', { class: `${base} ${map[0]}`, title: map[1] }, tok);
+  }
+  if (/^[+\-~?]?(include|redirect)[:=]/i.test(tok)) return h('span', { class: `${base} text-sky-700 bg-sky-50 dark:text-sky-300 dark:bg-sky-500/10`, title: 'Delegates to another SPF record' }, tok);
+  if (/^[+\-~?]?ip[46]:/i.test(tok)) return h('span', { class: `${base} text-emerald-700 bg-emerald-50 dark:text-emerald-300 dark:bg-emerald-500/10`, title: 'Authorised IP range' }, tok);
+  if (/^[+\-~?]?(a|mx|ptr|exists)([:/]|$)/i.test(tok)) return h('span', { class: `${base} text-violet-700 bg-violet-50 dark:text-violet-300 dark:bg-violet-500/10`, title: 'Host-based mechanism' }, tok);
+  return h('span', { class: `${base} text-slate-600 dark:text-slate-300` }, tok);
+}
+
+const spfView = (text) => h('div', { class: 'leading-7' }, text.trim().split(/\s+/).map(spfToken));
+
+function txtView(text, owner) {
+  const kind = classifyTxt(text, owner);
+  const body = kind === 'SPF' ? spfView(text) : mono(text, 'whitespace-pre-wrap');
+  return h('div', { class: 'space-y-1' }, kind && badge(kind, KIND_TONE[kind]), body);
+}
+
+function dataCell(rr) {
+  switch (rr.typeName) {
+    case 'TXT': return txtView(parseTxtData(rr.data), rr.name);
+    case 'MX': {
+      const [pri, ...rest] = rr.data.split(/\s+/);
+      return h('span', { class: 'inline-flex flex-wrap items-center gap-2' }, badge(`pri ${pri}`, 'sky', 'Lower preference is tried first'), mono(rest.join(' ')));
+    }
+    case 'A': case 'AAAA':
+      return h('span', { class: 'inline-flex flex-wrap items-center gap-2' }, mono(rr.data), copyBtn(rr.data));
+    default: return mono(rr.data);
+  }
+}
+
+// DNSSEC indicator from the AD bit. AD means "the resolver validated this", not "the zone is signed".
+function dnssecBadge(res, opts) {
+  if (!res.ok) return null;
+  if (res.flags.AD) return badge('DNSSEC validated (AD=1)', 'green', 'The resolver validated the DNSSEC chain for this answer.');
+  if (!opts.do) return badge('DNSSEC not requested', 'slate', 'Turn on the DO bit to ask the resolver for validation status.');
+  if (res.status === 2 && !opts.cd) return badge('DNSSEC may have failed', 'red', 'SERVFAIL with validation on. Retry with CD=1: if it then works, the signatures are broken.');
+  return badge('Not validated (AD=0)', 'amber', 'Either the zone is unsigned or the answer sits outside a signed chain. AD=0 alone does not prove the zone is unsigned.');
+}
+
+const statusInfo = (res) => {
+  if (!res.ok) return { text: 'ERROR', tone: 'red' };
+  if (res.status === 0) return res.answers.length ? { text: 'NOERROR', tone: 'green' } : { text: 'NODATA', tone: 'amber' };
+  return { text: RCODES[res.status] || `RCODE ${res.status}`, tone: 'red' };
+};
+
+// Build "a -> b -> c" from CNAME records, starting at the queried name.
+function cnameChain(answers, start) {
+  const map = new Map(answers.filter((r) => r.typeName === 'CNAME').map((r) => [r.name.toLowerCase(), r.data]));
+  const chain = [start]; let cur = start.toLowerCase().replace(/\.$/, '') + '.';
+  for (let i = 0; i < 12 && map.has(cur); i++) { const next = map.get(cur); chain.push(next); cur = next.toLowerCase(); }
+  return chain.length > 1 ? chain : null;
+}
+
+/* ======================================================================
+   VIEWS
+   ====================================================================== */
+const loading = (msg) => h('div', { class: 'card text-sm text-slate-500 dark:text-slate-400' }, msg);
+
+function summaryView(res, ctx) {
+  const info = statusInfo(res);
+  const chips = [badge(info.text, info.tone), dnssecBadge(res, ctx.opts), badge(DOH[res.resolver].label, 'slate')];
+  if (res.ok) {
+    chips.push(badge(`${res.rttMs} ms`, 'slate', 'Round trip from your browser to the resolver, including resolution'));
+    if (ctx.fmt === 'verbose') {
+      const set = Object.entries(res.flags).filter(([, v]) => v).map(([k]) => k).join(' ') || 'none';
+      chips.push(badge(`flags: ${set}`, 'slate', 'Header flags set in the response'));
+    }
+  }
+  return h('div', { class: 'card flex flex-wrap items-center gap-2' },
+    h('span', { class: 'mr-1 font-mono text-sm font-semibold' }, `${ctx.domain} ${ctx.type}`), chips);
+}
+
+function emptyView(res, ctx) {
+  const text = res.status === 3 ? `NXDOMAIN: ${ctx.domain} does not exist.`
+    : res.status === 0 ? `NODATA: ${ctx.domain} exists but has no ${ctx.type} record.`
+    : `${RCODES[res.status] || 'Error'} (RCODE ${res.status}) returned by the resolver.`;
+  return h('div', { class: 'rounded-lg border border-dashed border-slate-300 p-4 text-sm dark:border-slate-700' }, text,
+    res.comment && h('p', { class: 'help-text' }, res.comment));
+}
+
+function recordsView(res, ctx) {
+  if (!res.ok) {
+    return h('div', { class: 'space-y-1 rounded-lg border border-red-300 bg-red-50 p-4 text-sm text-red-800 dark:border-red-500/40 dark:bg-red-500/10 dark:text-red-200' },
+      h('p', { class: 'font-medium' }, res.error),
+      h('p', { class: 'text-xs opacity-80' }, `If this keeps happening, check that ${new URL(DOH[res.resolver].base).host} is reachable from your network.`));
+  }
+  const wrap = h('div', { class: 'space-y-3' });
+  let main = res.answers.filter((r) => r.typeName === ctx.type || r.typeName === 'CNAME');
+  if (ctx.type === 'MX') main = [...main].sort((a, b) => (parseInt(a.data, 10) || 0) - (parseInt(b.data, 10) || 0));
+  if (!main.length) { wrap.append(emptyView(res, ctx)); }
+
+  const chain = ctx.type === 'CNAME' ? null : cnameChain(res.answers, ctx.domain);
+  if (chain) {
+    const hasFinal = res.answers.some((r) => r.typeName === ctx.type);
+    wrap.append(h('div', { class: 'flex flex-wrap items-center gap-1.5 text-sm' },
+      badge('CNAME chain', 'violet'),
+      chain.map((n, i) => [i > 0 && h('span', { 'aria-hidden': 'true', class: 'text-slate-400' }, '→'), mono(n)]),
+      !hasFinal && badge(`no final ${ctx.type} record`, 'amber', 'The chain ends without the requested record type')));
+  }
+
+  if (main.length && ctx.fmt === 'short') {
+    wrap.append(h('ul', { class: 'space-y-1.5 rounded-lg bg-slate-100 p-3 dark:bg-slate-950' },
+      main.map((rr) => h('li', {}, dataCell(rr)))));
+  } else if (main.length) {
+    const th = 'px-2 py-1.5 text-left text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400';
+    wrap.append(h('div', { class: 'overflow-x-auto' }, h('table', { class: 'w-full text-sm' },
+      h('thead', {}, h('tr', {}, ['Name', 'TTL', 'Type', 'Data'].map((c) => h('th', { class: th, scope: 'col' }, c)))),
+      h('tbody', { class: 'divide-y divide-slate-200 dark:divide-slate-800' },
+        main.map((rr) => h('tr', { class: 'align-top' },
+          h('td', { class: 'px-2 py-2' }, mono(rr.name)),
+          h('td', { class: 'whitespace-nowrap px-2 py-2 text-slate-600 dark:text-slate-300', title: `${rr.ttl} seconds` }, `${rr.ttl} (${humanTTL(rr.ttl)})`),
+          h('td', { class: 'px-2 py-2' }, badge(rr.typeName)),
+          h('td', { class: 'px-2 py-2' }, dataCell(rr))))))));
+  }
+
+  // Verbose extras: authority section, DNSSEC records, resolver comment.
+  if (ctx.fmt === 'verbose') {
+    if (res.authority.length) {
+      wrap.append(h('div', {}, h('p', { class: 'lbl mb-1' }, 'Authority'),
+        h('ul', { class: 'space-y-1 text-xs' }, res.authority.map((rr) =>
+          h('li', {}, badge(rr.typeName), ' ', mono(rr.name), ' ', h('span', { class: 'text-slate-500' }, `ttl ${rr.ttl}`), ' ', mono(rr.data))))));
+    }
+    const extra = res.answers.filter((r) => !main.includes(r));
+    if (extra.length) wrap.append(h('p', { class: 'text-xs text-slate-500 dark:text-slate-400' },
+      `Also returned ${extra.length} DNSSEC record${extra.length > 1 ? 's' : ''} (${[...new Set(extra.map((r) => r.typeName))].join(', ')}).`));
+    if (res.comment) wrap.append(h('p', { class: 'text-xs text-slate-500 dark:text-slate-400' }, `Resolver note: ${res.comment}`));
+  }
+
+  // Convenience: related lookups people usually want next.
+  if (ctx.type === 'TXT' && !ctx.domain.includes('_domainkey')) {
+    const go = (name, type = 'TXT') => () => { els.domain.value = name; els.type.value = type; run(); };
+    wrap.append(h('div', { class: 'flex flex-wrap items-center gap-1.5 text-xs text-slate-500 dark:text-slate-400' },
+      'Also check:',
+      h('button', { type: 'button', class: 'chip', onclick: go(`_dmarc.${ctx.domain}`) }, '_dmarc'),
+      DKIM_SELECTORS.map((s) => h('button', { type: 'button', class: 'chip', onclick: go(`${s}._domainkey.${ctx.domain}`), title: `DKIM selector "${s}"` }, `${s}._domainkey`))));
+  }
+  return wrap;
+}
+
+function compareView(results, ctx) {
+  const key = (res) => (res.ok ? res.answers.filter((r) => r.typeName === ctx.type || r.typeName === 'CNAME').map((r) => `${r.typeName}|${r.data.toLowerCase()}`).sort().join('\n') : null);
+  const [a, b] = results.map(key);
+  const verdict = a == null || b == null ? badge('One resolver failed', 'red')
+    : a === b ? badge('Resolvers agree', 'green', 'Same record set (TTLs ignored)')
+    : badge('Answers differ', 'amber', 'Can be normal: GeoDNS, mid-propagation, or different cache states');
+  return h('div', { class: 'space-y-3' },
+    h('div', { class: 'card flex flex-wrap items-center gap-2' },
+      h('span', { class: 'font-mono text-sm font-semibold' }, `${ctx.domain} ${ctx.type}`), verdict),
+    h('div', { class: 'grid gap-3 xl:grid-cols-2' }, results.map((res) =>
+      h('div', { class: 'card min-w-0 space-y-3' }, summaryView(res, ctx), recordsView(res, ctx)))));
+}
+
+/* ======================================================================
+   SIMULATED TRACE  (real NS data per zone, resolver does the recursion)
+   ====================================================================== */
+function traceZones(name) {
+  const labels = name.split('.');
+  const zones = ['.'];
+  for (let i = labels.length - 1; i >= 0; i--) zones.push(`${labels.slice(i).join('.')}.`);
+  return zones.length > 6 ? [zones[0], zones[1], ...zones.slice(-4)] : zones;   // keep it readable for deep names
+}
+
+async function traceView(mount, ctx, finalRes, isStale, signal) {
+  const list = h('ol', { class: 'space-y-3' });
+  mount.replaceChildren(card('Simulated trace',
+    `Real NS data fetched through ${DOH[ctx.resolver].label}, root downward. The path is reconstructed; the resolver did the actual recursion.`, list));
+
+  const step = (n, title, sub) => {
+    const body = h('div', { class: 'text-sm text-slate-500 dark:text-slate-400' }, 'Querying…');
+    const meta = h('span', { class: 'text-xs text-slate-500 dark:text-slate-400' });
+    list.append(h('li', { class: 'flex gap-3' },
+      h('span', { class: 'mt-0.5 flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-sky-600 text-xs font-semibold text-white' }, n),
+      h('div', { class: 'min-w-0 flex-1 space-y-1' },
+        h('div', { class: 'flex flex-wrap items-center gap-2' }, mono(title, 'font-semibold'), badge(sub), meta), body)));
+    return { body, meta };
+  };
+
+  const zones = traceZones(ctx.domain);
+  let i = 0;
+  for (const zone of zones) {
+    i++;
+    const s = step(i, zone === '.' ? '. (root)' : zone, 'NS');
+    const res = await queryDoH(ctx.resolver, zone, 'NS', { do: false, cd: false }, signal);
+    if (isStale()) return;
+    s.meta.textContent = `${res.rttMs} ms`;
+    if (!res.ok) { s.body.textContent = res.error; continue; }
+    const ns = res.answers.filter((r) => r.typeName === 'NS' && r.name.toLowerCase() === zone);
+    if (!ns.length) { s.body.textContent = 'No NS records here: not a zone cut, this name lives inside its parent zone.'; continue; }
+    const shown = ns.slice(0, 8);
+    s.body.replaceChildren(h('div', { class: 'flex flex-wrap gap-1.5' }, shown.map((r) => mono(r.data, 'rounded bg-slate-100 px-1.5 dark:bg-slate-800')),
+      ns.length > shown.length && h('span', { class: 'text-xs' }, `+${ns.length - shown.length} more`)));
+  }
+  const last = step(i + 1, `${ctx.domain}.`, ctx.type);
+  last.meta.textContent = finalRes.ok ? `${finalRes.rttMs} ms` : '';
+  last.body.textContent = !finalRes.ok ? finalRes.error
+    : finalRes.answers.some((r) => r.typeName === ctx.type) ? `${finalRes.answers.filter((r) => r.typeName === ctx.type).length} record(s) returned, see above.`
+    : statusInfo(finalRes).text;
+}
+
+/* ======================================================================
+   SIMULATED PROPAGATION MATRIX  (seeded so a domain always "propagates" the same way)
+   ====================================================================== */
+const hash32 = (str) => { let x = 2166136261 >>> 0; for (let i = 0; i < str.length; i++) { x ^= str.charCodeAt(i); x = Math.imul(x, 16777619) >>> 0; } return x; };
+const mulberry32 = (a) => () => { a |= 0; a = (a + 0x6D2B79F5) | 0; let t = Math.imul(a ^ (a >>> 15), 1 | a); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
+
+let propTimer = null;
+const stopPropagation = () => { clearInterval(propTimer); propTimer = null; };
+
+const REGION_BADGE = { synced: ['Synced', 'green'], propagating: ['Propagating', 'amber'], error: ['Error', 'red'] };
+
+function startPropagation(mount, domain, type, healthy) {
+  stopPropagation();
+  const rng = mulberry32(hash32(`${domain}|${type}`));
+  const failIdx = healthy && rng() < 0.15 ? Math.floor(rng() * REGIONS.length) : -1;   // at most one flaky region
+  const regions = REGIONS.map((r, i) => ({
+    ...r, rtt: r.base, progress: healthy ? 0 : 100, speed: 12 + rng() * 18, fail: !healthy || i === failIdx,
+  }));
+  const statusOf = (r) => (r.fail && r.progress >= (healthy ? 55 : 0) ? 'error' : r.progress >= 100 ? 'synced' : 'propagating');
+
+  const cells = regions.map((r) => {
+    const bar = h('div', { class: 'h-full rounded-full bg-sky-500 motion-safe:transition-[width] motion-safe:duration-500', style: 'width:0%' });
+    const rtt = h('span', { class: 'font-mono text-xs text-slate-500 dark:text-slate-400' });
+    const bdg = h('span');
+    const el = h('div', { class: 'rounded-lg border border-slate-200 p-3 dark:border-slate-800' },
+      h('div', { class: 'flex items-center justify-between gap-2' }, h('span', { class: 'text-sm font-medium' }, r.name), rtt),
+      h('div', { class: 'mt-2 flex items-center justify-between gap-2' }, bdg),
+      h('div', { class: 'mt-2 h-1.5 overflow-hidden rounded-full bg-slate-200 dark:bg-slate-800', 'aria-hidden': 'true' }, bar));
+    return { el, bar, rtt, bdg };
+  });
+  const summary = h('p', { class: 'text-xs text-slate-500 dark:text-slate-400' });
+  const done = h('p', { class: 'sr-only', role: 'status' });
+  const replay = h('button', { type: 'button', class: 'chip', onclick: () => startPropagation(mount, domain, type, healthy) }, 'Replay');
+
+  const paint = () => {
+    let synced = 0;
+    regions.forEach((r, i) => {
+      const st = statusOf(r); if (st === 'synced') synced++;
+      const [text, tone] = REGION_BADGE[st];
+      cells[i].bdg.replaceWith((cells[i].bdg = badge(text, tone)));
+      cells[i].bar.style.width = `${Math.min(100, Math.round(r.progress))}%`;
+      cells[i].bar.className = cells[i].bar.className.replace(/bg-\w+-500/, st === 'error' ? 'bg-red-500' : st === 'synced' ? 'bg-emerald-500' : 'bg-amber-500');
+      cells[i].rtt.textContent = `${Math.round(r.rtt)} ms`;
+    });
+    summary.textContent = `${synced}/${regions.length} regions synced`;
+    return regions.every((r) => statusOf(r) !== 'propagating');
+  };
+
+  mount.replaceChildren(card('Global propagation (simulated)',
+    'Placeholder latencies and a seeded progress model. These are NOT real regional probes.',
+    h('div', { class: 'flex items-center justify-between gap-2' }, summary, replay),
+    h('div', { class: 'grid grid-cols-2 gap-3 sm:grid-cols-3 xl:grid-cols-5' }, cells.map((c) => c.el)), done));
+
+  if (paint()) { done.textContent = summary.textContent; return; }
+  propTimer = setInterval(() => {
+    regions.forEach((r) => {
+      if (statusOf(r) === 'propagating' || (r.fail && r.progress < 55)) r.progress += r.speed * (0.6 + rng() * 0.8);
+      r.rtt = Math.max(5, r.base + (rng() - 0.5) * r.base * 0.12);
+    });
+    if (paint()) { stopPropagation(); done.textContent = `Simulation finished. ${summary.textContent}.`; }
+  }, 1200);
+}
+
+/* ======================================================================
+   COMMAND + ZONE SNIPPET GENERATORS
+   ====================================================================== */
+function digCommand(ctx) {
+  const parts = ['dig'];
+  if (ctx.mode === 'trace') parts.push(ctx.domain, ctx.type, '+trace');
+  else parts.push(`@${DOH[ctx.resolver].ip}`, ctx.domain, ctx.type);
+  if (ctx.opts.do) parts.push('+dnssec');
+  if (ctx.opts.cd) parts.push('+cdflag');
+  if (ctx.opts.ecs && DOH[ctx.resolver].ecs && ctx.mode !== 'trace') parts.push(`+subnet=${ctx.opts.ecs}`);
+  if (ctx.fmt === 'short') parts.push('+short');
+  return parts.join(' ');
+}
+
+function bindSnippet(res, ctx) {
+  const stamp = new Date().toISOString();
+  const head = `; DNS Pulse snapshot via ${DOH[res.resolver].label} (${DOH[res.resolver].ip}) at ${stamp}`;
+  const rrs = res.ok ? res.answers.filter((r) => r.typeName === ctx.type || r.typeName === 'CNAME') : [];
+  if (!rrs.length) return `${head}\n; no ${ctx.type} records returned for ${ctx.domain}.`;
+  const dot = (n) => (n.endsWith('.') ? n : `${n}.`);
+  const lines = rrs.map((r) => {
+    let rdata = r.data;
+    if (r.typeName === 'TXT') {
+      const txt = parseTxtData(r.data).replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+      rdata = (txt.match(/.{1,255}/gs) || ['']).map((c) => `"${c}"`).join(' ');   // 255-byte string limit
+    }
+    return `${dot(r.name)}\t${r.ttl}\tIN\t${r.typeName}\t${rdata}`;
+  });
+  return [head, ...lines].join('\n');
+}
+
+function commandsView(res, ctx) {
+  const dig = digCommand(ctx);
+  const zone = bindSnippet(res, ctx);
+  const block = (label, note, text, toastMsg) => h('div', { class: 'space-y-1' },
+    h('div', { class: 'flex items-center justify-between gap-2' },
+      h('div', {}, h('p', { class: 'text-xs font-semibold' }, label), h('p', { class: 'help-text !mt-0' }, note)),
+      copyBtn(text, 'Copy', toastMsg)),
+    h('pre', { class: 'overflow-x-auto rounded-lg bg-slate-100 p-3 font-mono text-[13px] dark:bg-slate-950' }, text));
+  return card('Commands & snippets', null,
+    block('dig equivalent', 'Classic DNS over UDP/53, so results can differ slightly from DoH.', dig, 'dig command copied'),
+    block('BIND zone snippet', 'Snapshot of the records above, absolute names, TXT split at 255 bytes.', zone, 'Zone snippet copied'),
+    h('div', { class: 'flex flex-wrap gap-2 border-t border-slate-200 pt-3 dark:border-slate-800' },
+      copyBtn(shareUrl(false), 'Copy link', 'Link copied'), copyBtn(shareUrl(true), 'Copy compact link', 'Compact link copied')));
+}
+
+/* ======================================================================
+   CONTROLLER
+   ====================================================================== */
+let runId = 0;
+let inflight = null;
+
+function setBusy(on) {
+  els.results.setAttribute('aria-busy', String(on));
+  els.run.disabled = on;
+  els.run.textContent = on ? 'Resolving…' : 'Resolve';
+}
+
+async function run() {
+  const my = ++runId;
+  inflight?.abort();
+  inflight = new AbortController();
+  const signal = inflight.signal;
+  const isStale = () => my !== runId;
+  stopPropagation();
+
+  readFormIntoState();
+  let domain;
+  try { domain = normalizeDomain(state.domain); }
+  catch (e) { showError(e.message); return; }
+  hideError();
+  state.domain = domain;
+  els.domain.value = domain;
+  writeUrl();
+
+  const ctx = { domain, type: state.type, resolver: state.resolver, mode: state.mode, fmt: state.fmt, opts: { ...state.opts, ecs: state.ecs } };
+  const v = { summary: h('div'), answer: h('div'), trace: h('div'), prop: h('div'), cmd: h('div') };
+  els.results.replaceChildren(v.summary, v.answer, v.trace, v.prop, v.cmd);
+  v.answer.append(loading(ctx.mode === 'compare' ? 'Querying both resolvers…' : `Querying ${DOH[ctx.resolver].label}…`));
+  setBusy(true);
+
+  let primary;
+  if (ctx.mode === 'compare') {
+    const results = await Promise.all(Object.keys(DOH).map((k) => queryDoH(k, domain, ctx.type, ctx.opts, signal)));
+    if (isStale()) return;
+    v.answer.replaceChildren(compareView(results, ctx));
+    primary = results.find((r) => r.ok) || results[0];
+    ctx.resolver = primary.resolver;                      // commands reference the resolver we show
+  } else {
+    primary = await queryDoH(ctx.resolver, domain, ctx.type, ctx.opts, signal);
+    if (isStale()) return;
+    v.summary.replaceChildren(summaryView(primary, ctx));
+    v.answer.replaceChildren(card('Answer', null, recordsView(primary, ctx)));
+  }
+  v.cmd.replaceChildren(commandsView(primary, ctx));
+  const healthy = primary.ok && primary.status === 0 && primary.answers.length > 0;
+  startPropagation(v.prop, domain, ctx.type, healthy);
+  setBusy(false);
+
+  if (ctx.mode === 'trace') await traceView(v.trace, ctx, primary, isStale, signal);
+}
+
+/* ---------- wiring ---------- */
+els.form.addEventListener('submit', (e) => { e.preventDefault(); run(); });
+els.form.addEventListener('change', syncAvailability);
+
+// Micro-help toggles (delegated).
+document.addEventListener('click', (e) => {
+  const btn = e.target.closest('[data-help]');
+  if (!btn) return;
+  const target = document.getElementById(btn.dataset.help);
+  const open = target.hidden;
+  target.hidden = !open;
+  btn.setAttribute('aria-expanded', String(open));
+});
+
+// Example chips.
+$('#examples').append(...EXAMPLES.map(([d, t]) =>
+  h('button', { type: 'button', class: 'chip font-mono', onclick: () => { els.domain.value = d; els.type.value = t; run(); } }, `${d} ${t}`)));
+
+// Theme toggle.
+const themeLabel = $('#theme-label');
+const paintTheme = () => { themeLabel.textContent = document.documentElement.classList.contains('dark') ? 'Light mode' : 'Dark mode'; };
+$('#theme-toggle').addEventListener('click', () => {
+  const dark = document.documentElement.classList.toggle('dark');
+  try { localStorage.setItem('dnspulse-theme', dark ? 'dark' : 'light'); } catch { /* storage blocked */ }
+  paintTheme();
+});
+paintTheme();
+
+/* ---------- init ---------- */
+state = readUrl();
+applyStateToForm();
+if (state.domain) run();     // deep link: resolve immediately
+</script>
+</body>
+</html>
